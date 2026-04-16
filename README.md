@@ -1,60 +1,111 @@
 
-# Multi-Container Runtime (OS Jackfruit)
+# Multi-Container Runtime
 
 ## 1. Team Information
-- Names : Riyana K  & Rhea Menon
+- Riyana K  & Rhea Menon
 - SRN: PES1UG24AM226 & PES1UG24AM222
- 
 
 ---
 
 ## 2. Build, Load, and Run Instructions
 
-### Step 1: Build
+### Environment
+- Ubuntu 22.04 / 24.04 (UTM VM)
+- Secure Boot OFF
+
+Install dependencies:
+```bash
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r)
+```
+
+---
+
+### Step 1 — Build
 ```bash
 make
 ```
 
-### Step 2: Load Kernel Module
+---
+
+### Step 2 — Prepare Root Filesystem (ARM)
 ```bash
-sudo insmod monitor.ko
-ls -l /dev/container_monitor
+mkdir rootfs-base
+wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz
+tar -xzf alpine-minirootfs-3.20.3-aarch64.tar.gz -C rootfs-base
 ```
 
-### Step 3: Start Supervisor
-```bash
-sudo ./engine supervisor ./rootfs-base
-```
-
-### Step 4: Create Root Filesystems
+Create container copies:
 ```bash
 cp -a ./rootfs-base ./rootfs-alpha
 cp -a ./rootfs-base ./rootfs-beta
 ```
 
-### Step 5: Start Containers
+---
+
+### Step 3 — Load Kernel Module
 ```bash
-sudo ./engine start alpha ./rootfs-alpha "sleep 100"
-sudo ./engine start beta ./rootfs-beta "sleep 100"
+sudo insmod monitor.ko
+ls -l /dev/container_monitor
 ```
 
-### Step 6: CLI Usage
+---
+
+### Step 4 — Start Supervisor (Terminal 1)
 ```bash
+sudo ./engine supervisor ./rootfs-base
+```
+
+---
+
+### Step 5 — CLI Commands (Terminal 2)
+```bash
+sudo ./engine start s1 ./rootfs-alpha "sleep 100"
+sudo ./engine start s2 ./rootfs-beta "sleep 100"
 sudo ./engine ps
-sudo ./engine logs alpha
-sudo ./engine stop alpha
+sudo ./engine logs s1
+sudo ./engine stop s1
+sudo ./engine stop s2
 ```
 
-### Step 7: Run Workloads
+---
+
+### Step 6 — Memory Experiments
+Soft limit:
+```bash
+sudo ./engine start soft1 ./rootfs-alpha "/memory_hog" --soft-mib 10 --hard-mib 200
+sudo dmesg | tail -20
+```
+
+Hard limit:
+```bash
+sudo ./engine start hard1 ./rootfs-beta "/memory_hog" --soft-mib 10 --hard-mib 20
+sudo dmesg | tail -20
+```
+
+---
+
+### Step 7 — Scheduling Experiments
+
+CPU vs CPU:
 ```bash
 sudo ./engine start cpu0 ./rootfs-alpha "/cpu_hog" --nice 0
-sudo ./engine start io0 ./rootfs-beta "/io_pulse" --nice 0
+sudo ./engine start cpu10 ./rootfs-beta "/cpu_hog" --nice 10
 ```
 
-### Step 8: Cleanup
+CPU vs IO:
 ```bash
-sudo ./engine stop alpha
-sudo ./engine stop beta
+sudo ./engine start cpuA ./rootfs-alpha "/cpu_hog"
+sudo ./engine start ioA ./rootfs-beta "/io_pulse"
+```
+
+---
+
+### Step 8 — Cleanup
+```bash
+sudo ./engine stop s1
+sudo ./engine stop s2
+ps -ef | grep Z
 sudo rmmod monitor
 ```
 
@@ -62,109 +113,112 @@ sudo rmmod monitor
 
 ## 3. Demo with Screenshots
 
-All screenshots are stored in `/screenshots/`.
-
 ### 1. Multi-container supervision
 ![1](screenshots/1.png)  
-Shows two containers running under a single supervisor.
+Two containers running under a single supervisor.
 
 ### 2. Metadata tracking
 ![2](screenshots/2.png)  
-Displays container metadata using `ps`.
+`engine ps` output showing container metadata.
 
 ### 3. Bounded-buffer logging
 ![3](screenshots/3.png)  
-Shows logs being captured correctly.
+Logging pipeline capturing container output.
 
 ### 4. CLI and IPC
 ![4](screenshots/4.png)  
-Demonstrates CLI communication with supervisor.
+CLI interacting with supervisor via socket IPC.
 
 ### 5. Soft-limit warning
 ![5](screenshots/5.png)  
-Shows soft memory limit warning from kernel logs.
+Kernel soft memory warning event.
 
 ### 6. Hard-limit enforcement
 ![6](screenshots/6.png)  
-Shows container termination after exceeding hard limit.
+Container killed after exceeding memory limit.
 
-### 7. Scheduling experiment
+### 7. Scheduling experiment (CPU vs CPU)
 ![7](screenshots/7.png)  
-Two CPU-bound containers with different nice values (0 vs 10) showing scheduling differences.
+Different nice values affecting CPU scheduling.
 
-### 8. Scheduling experiment
+### 8. Scheduling experiment (CPU vs IO)
 ![8](screenshots/8.png)  
-CPU-bound vs IO-bound workloads demonstrating Linux scheduler fairness and responsiveness.
+CPU-bound vs IO-bound workload behavior.
 
 ### 9. Clean teardown
 ![9](screenshots/9.png)  
-No zombie processes after stopping containers.
+Containers cleaned up, no zombies remain.
 
 ---
 
 ## 4. Engineering Analysis
 
-### Process Isolation
-Containers use namespaces to isolate execution environments.
+### Isolation Mechanisms
+Containers use PID, UTS, and mount namespaces along with chroot to isolate processes and filesystems. All containers share the same kernel but operate in separate execution environments.
 
-### Memory Monitoring
-Kernel module tracks RSS and enforces limits using ioctl.
+### Supervisor and Process Lifecycle
+A persistent supervisor process manages all containers. It spawns children using clone(), tracks metadata, and reaps processes using waitpid() to prevent zombies.
 
-### IPC Mechanisms
-Uses Unix domain sockets for control-plane communication.
+### IPC, Threads, and Synchronization
+Two IPC mechanisms are used:
+- Pipes for logging (container → supervisor)
+- UNIX domain socket for CLI (client → supervisor)
 
-### Logging System
-Implements producer-consumer bounded buffer.
+A bounded buffer with mutex and condition variables ensures safe concurrent logging.
 
-### Scheduling
-Nice values influence CPU scheduling fairness.
+### Memory Management and Enforcement
+RSS measures actual physical memory usage. Soft limits generate warnings while hard limits enforce termination. Enforcement is done in kernel space for reliability.
+
+### Scheduling Behavior
+Experiments show that:
+- Lower nice values receive more CPU time
+- IO-bound processes yield CPU, improving responsiveness
+- Linux scheduler balances fairness and throughput
 
 ---
 
 ## 5. Design Decisions and Tradeoffs
 
 ### Namespace Isolation
-- Choice: Minimal namespace usage  
-- Tradeoff: Less isolation but simpler implementation  
-- Justification: Sufficient for project scope
+- Choice: chroot + namespaces  
+- Tradeoff: less secure than pivot_root  
+- Justification: simpler and sufficient for project scope  
 
 ### Supervisor Architecture
-- Choice: Single supervisor process  
-- Tradeoff: Single point of failure  
-- Justification: Easier coordination
+- Choice: single supervisor  
+- Tradeoff: central bottleneck  
+- Justification: easier lifecycle management  
 
-### IPC & Logging
-- Choice: Unix sockets + pipes  
-- Tradeoff: Blocking behavior  
-- Justification: Simpler than shared memory
+### IPC and Logging
+- Choice: pipes + bounded buffer  
+- Tradeoff: complexity  
+- Justification: prevents data loss  
 
 ### Kernel Monitor
-- Choice: LKM with ioctl  
-- Tradeoff: Kernel complexity  
-- Justification: Direct access to memory stats
+- Choice: timer-based RSS monitoring  
+- Tradeoff: not real-time precise  
+- Justification: efficient and simple  
 
-### Scheduling
-- Choice: Nice-based scheduling  
-- Tradeoff: Limited control  
-- Justification: Demonstrates Linux behavior clearly
+### Scheduling Experiments
+- Choice: nice values  
+- Tradeoff: limited control  
+- Justification: demonstrates real scheduler behavior  
 
 ---
 
 ## 6. Scheduler Experiment Results
 
-### CPU vs CPU
-| Container | Nice | Behavior |
-|----------|------|---------|
-| cpu0     | 0    | Faster execution |
-| cpu10    | 10   | Slower execution |
+| Experiment | Observation |
+|-----------|------------|
+| CPU vs CPU | Lower nice value dominates CPU |
+| CPU vs IO  | IO workload remains responsive |
 
-### CPU vs IO
-| Container | Type | Observation |
-|----------|------|------------|
-| cpuA     | CPU-bound | Uses full CPU |
-| ioA      | IO-bound  | Yields CPU |
-
-### Conclusion
-Linux scheduler prioritizes lower nice values and favors IO-bound tasks for responsiveness.
+Conclusion:
+Linux scheduler prioritizes fairness and responsiveness, dynamically allocating CPU time.
 
 ---
+
+## Notes
+- Each container uses a unique writable rootfs
+- Logging ensures no data loss
+- Kernel module enforces memory constraints
