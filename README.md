@@ -90,10 +90,14 @@ Shows container termination after exceeding hard limit.
 
 ### 7. Scheduling experiment
 ![7](screenshots/7.png)  
-Comparison of CPU scheduling behavior.
+Two CPU-bound containers with different nice values (0 vs 10) showing scheduling differences.
 
-### 8. Clean teardown
+### 8. Scheduling experiment
 ![8](screenshots/8.png)  
+CPU-bound vs IO-bound workloads demonstrating Linux scheduler fairness and responsiveness.
+
+### 9. Clean teardown
+![9](screenshots/9.png)  
 No zombie processes after stopping containers.
 
 ---
