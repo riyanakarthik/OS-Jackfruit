@@ -980,11 +980,230 @@ case CMD_STOP: {
     pthread_mutex_unlock(&ctx.metadata_lock);
     break;
 }
-case CMD_RUN:
-    resp.status = 0;
-    snprintf(resp.message, sizeof(resp.message),
-             "RUN not implemented yet.");
+case CMD_RUN: {
+    pid_t pid;
+    child_config_t *cfg;
+    void *stack;
+    int pipefd[2];
+    int status;
+    char abs_rootfs[PATH_MAX];
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+
+    if (find_container(&ctx, req.container_id) != NULL) {
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Container %s already exists.", req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+        break;
+    }
+
+    if (add_container_record(&ctx,
+                             req.container_id,
+                             req.soft_limit_bytes,
+                             req.hard_limit_bytes) != 0) {
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Failed to add container %s.", req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+        break;
+    }
+
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    if (pipe(pipefd) < 0) {
+        pthread_mutex_lock(&ctx.metadata_lock);
+        remove_container_record(&ctx, req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "pipe() failed for %s.", req.container_id);
+        break;
+    }
+
+    cfg = calloc(1, sizeof(*cfg));
+    if (cfg == NULL) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        pthread_mutex_lock(&ctx.metadata_lock);
+        remove_container_record(&ctx, req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Failed to allocate child config.");
+        break;
+    }
+
+    strncpy(cfg->id, req.container_id, sizeof(cfg->id) - 1);
+
+    if (realpath(req.rootfs, abs_rootfs) == NULL) {
+        perror("realpath");
+        free(cfg);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        pthread_mutex_lock(&ctx.metadata_lock);
+        remove_container_record(&ctx, req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Invalid rootfs path: %s", req.rootfs);
+        break;
+    }
+
+    strncpy(cfg->rootfs, abs_rootfs, sizeof(cfg->rootfs) - 1);
+    strncpy(cfg->command, req.command, sizeof(cfg->command) - 1);
+    cfg->nice_value = req.nice_value;
+    cfg->log_write_fd = pipefd[1];
+
+    stack = malloc(STACK_SIZE);
+    if (stack == NULL) {
+        free(cfg);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        pthread_mutex_lock(&ctx.metadata_lock);
+        remove_container_record(&ctx, req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Failed to allocate child stack.");
+        break;
+    }
+
+    pid = clone(child_fn,
+                (char *)stack + STACK_SIZE,
+                CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                cfg);
+
+    if (pid < 0) {
+        perror("clone");
+        free(stack);
+        free(cfg);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        pthread_mutex_lock(&ctx.metadata_lock);
+        remove_container_record(&ctx, req.container_id);
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "clone() failed for %s.", req.container_id);
+        break;
+    }
+
+    close(pipefd[1]);
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    {
+        container_record_t *rec = find_container(&ctx, req.container_id);
+        if (rec != NULL) {
+            rec->host_pid = pid;
+            rec->state = CONTAINER_RUNNING;
+            rec->log_read_fd = pipefd[0];
+        }
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
+    if (register_with_monitor(ctx.monitor_fd,
+                              req.container_id,
+                              pid,
+                              req.soft_limit_bytes,
+                              req.hard_limit_bytes) < 0) {
+        perror("register_with_monitor");
+    }
+
+    /*
+     * Foreground wait:
+     * keep draining logs while waiting for this specific child to finish.
+     */
+    while (1) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+
+        drain_container_logs(&ctx);
+
+        if (w == pid)
+            break;
+
+        if (w < 0) {
+            perror("waitpid");
+            status = -1;
+            break;
+        }
+
+        usleep(100000); /* 100 ms */
+    }
+
+    drain_container_logs(&ctx);
+
+    pthread_mutex_lock(&ctx.metadata_lock);
+    {
+        container_record_t *rec = find_container(&ctx, req.container_id);
+        if (rec != NULL) {
+            if (status != -1) {
+                if (WIFEXITED(status)) {
+                    rec->state = CONTAINER_EXITED;
+                    rec->exit_code = WEXITSTATUS(status);
+                    rec->exit_signal = 0;
+                } else if (WIFSIGNALED(status)) {
+                    rec->state = CONTAINER_KILLED;
+                    rec->exit_code = -1;
+                    rec->exit_signal = WTERMSIG(status);
+                }
+            }
+
+            if (ctx.monitor_fd >= 0) {
+                if (unregister_from_monitor(ctx.monitor_fd,
+                                            rec->id,
+                                            rec->host_pid) < 0) {
+                    perror("unregister_from_monitor");
+                }
+            }
+
+            if (rec->log_read_fd >= 0) {
+                close(rec->log_read_fd);
+                rec->log_read_fd = -1;
+            }
+
+            if (status != -1) {
+                if (WIFEXITED(status)) {
+                    resp.status = WEXITSTATUS(status);
+                    snprintf(resp.message, sizeof(resp.message),
+                             "Container %s exited with code %d.",
+                             rec->id, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    resp.status = 128 + WTERMSIG(status);
+                    snprintf(resp.message, sizeof(resp.message),
+                             "Container %s terminated by signal %d.",
+                             rec->id, WTERMSIG(status));
+                } else {
+                    resp.status = 1;
+                    snprintf(resp.message, sizeof(resp.message),
+                             "Container %s finished with unknown status.",
+                             rec->id);
+                }
+            } else {
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message),
+                         "Container %s wait failed.", rec->id);
+            }
+        } else {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "Container %s disappeared before final status update.",
+                     req.container_id);
+        }
+    }
+    pthread_mutex_unlock(&ctx.metadata_lock);
+
     break;
+}
 
 case CMD_LOGS: {
     container_record_t *rec;
